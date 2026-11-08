@@ -1,0 +1,9 @@
+.git
+.env
+*.db
+storage/
+__pycache__/
+.pytest_cache/
+README.md
+Календарь_головной_боли.html
+Статистика_препаратов.html
