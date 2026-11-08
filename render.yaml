@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: after-meeting
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        value: sqlite:///./after_meeting.db
+      - key: STORAGE_DIR
+        value: ./storage
+      - key: MAX_AUDIO_MINUTES
+        value: "60"
+      - key: MAX_FILE_MB
+        value: "250"
+      - key: AUDIO_RETENTION_HOURS
+        value: "24"
