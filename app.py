@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64, hashlib, json, mimetypes, os, shutil, subprocess, threading, uuid
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ ALLOWED = {".mp3", ".wav", ".m4a"}
 LOCK = threading.Lock()
 
 app = FastAPI(title="После встречи", version="1.0.0")
+logger = logging.getLogger("after_meeting")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 @app.exception_handler(RequestValidationError)
@@ -166,8 +168,13 @@ def process_meeting(mid,path,duration):
             for t in cards.get("tasks",[]):
                 if t.get("text") and t.get("source_segment_id") in valid: c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?)",(str(uuid.uuid4()),mid,t["text"],t.get("assignee"),t.get("due_date"),t["source_segment_id"],"pending"))
             c.execute("UPDATE meetings SET status='ready',stage='ready' WHERE id=?",(mid,))
-    except Exception:
-        with db() as c: c.execute("UPDATE meetings SET status='failed',stage='failed',error_code='PROCESSING_FAILED' WHERE id=?",(mid,))
+    except Exception as exc:
+        if isinstance(exc, httpx.HTTPStatusError):
+            logger.error("Gemini/API request failed: status=%s body=%s", exc.response.status_code, exc.response.text[:800])
+        else:
+            logger.exception("Processing failed for meeting %s: %s", mid, type(exc).__name__)
+        code="API_UNAVAILABLE" if isinstance(exc, (httpx.HTTPError, json.JSONDecodeError)) else "PROCESSING_FAILED"
+        with db() as c: c.execute("UPDATE meetings SET status='failed',stage='failed',error_code=? WHERE id=?",(code,mid))
     finally: path.unlink(missing_ok=True)
 
 def stt(path):
@@ -177,7 +184,7 @@ def stt(path):
 
 def gemini_extract(path, meeting_date):
     """Transcribe audio and extract cards in one Gemini request."""
-    mime=mimetypes.guess_type(path.name)[0] or "audio/wav"
+    mime={".wav":"audio/wav",".mp3":"audio/mpeg",".m4a":"audio/mp4"}.get(path.suffix.lower(), "audio/wav")
     encoded=base64.b64encode(path.read_bytes()).decode("ascii")
     prompt=f'''Ты обрабатываешь русскоязычную запись встречи от {meeting_date}.
 Верни только валидный JSON без markdown и комментариев:
