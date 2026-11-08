@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import base64, hashlib, json, mimetypes, os, shutil, subprocess, threading, uuid
+import base64, hashlib, json, mimetypes, os, shutil, subprocess, threading, time, uuid
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -190,11 +190,21 @@ def gemini_extract(path, meeting_date):
 Верни только валидный JSON без markdown и комментариев:
 {{"segments":[{{"start_ms":0,"end_ms":1000,"text":"..."}}],"decisions":[{{"text":"...","source_segment_index":0}}],"tasks":[{{"text":"...","assignee":null,"due_date":null,"source_segment_index":0}}]}}
 Разбей расшифровку на последовательные смысловые сегменты с временными метками в миллисекундах. Индекс источника начинается с 0. Не выдумывай исполнителя и срок: неизвестные значения null. Относительные сроки указывай в YYYY-MM-DD только если дата однозначна, иначе null.'''
-    model=os.getenv("GEMINI_MODEL","gemini-2.5-flash")
+    model=os.getenv("GEMINI_MODEL","gemini-3.8-flash")
     url=f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload={"contents":[{"parts":[{"text":prompt},{"inline_data":{"mime_type":mime,"data":encoded}}]}],"generationConfig":{"responseMimeType":"application/json","temperature":0.1}}
+    retries=int(os.getenv("MAX_RETRIES","2"))
     with httpx.Client(timeout=300) as h:
-        response=h.post(url,params={"key":os.environ["GEMINI_API_KEY"]},json=payload); response.raise_for_status(); data=response.json()
+        for attempt in range(retries+1):
+            try:
+                response=h.post(url,params={"key":os.environ["GEMINI_API_KEY"]},json=payload)
+                response.raise_for_status()
+                data=response.json()
+                break
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in {429,500,502,503,504} or attempt >= retries:
+                    raise
+                time.sleep(2 ** attempt)
     text=data["candidates"][0]["content"]["parts"][0]["text"].strip()
     if text.startswith("```"): text=text.split("\n",1)[1].rsplit("```",1)[0].strip()
     result=json.loads(text)
