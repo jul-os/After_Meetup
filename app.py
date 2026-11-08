@@ -190,7 +190,7 @@ def gemini_extract(path, meeting_date):
 Верни только валидный JSON без markdown и комментариев:
 {{"segments":[{{"start_ms":0,"end_ms":1000,"text":"..."}}],"decisions":[{{"text":"...","source_segment_index":0}}],"tasks":[{{"text":"...","assignee":null,"due_date":null,"source_segment_index":0}}]}}
 Разбей расшифровку на последовательные смысловые сегменты с временными метками в миллисекундах. Индекс источника начинается с 0. Не выдумывай исполнителя и срок: неизвестные значения null. Относительные сроки указывай в YYYY-MM-DD только если дата однозначна, иначе null.'''
-    model=os.getenv("GEMINI_MODEL","gemini-3.8-flash")
+    model=os.getenv("GEMINI_MODEL","gemini-3.5-flash-lite")
     url=f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload={"contents":[{"parts":[{"text":prompt},{"inline_data":{"mime_type":mime,"data":encoded}}]}],"generationConfig":{"responseMimeType":"application/json","temperature":0.1}}
     retries=int(os.getenv("MAX_RETRIES","2"))
