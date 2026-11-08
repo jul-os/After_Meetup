@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib, json, mimetypes, os, shutil, subprocess, threading, uuid
+import base64, hashlib, json, mimetypes, os, shutil, subprocess, threading, uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -140,14 +140,25 @@ def fallback_segments():
 def process_meeting(mid,path,duration):
     try:
         with db() as c: c.execute("UPDATE meetings SET status='processing',stage='transcription' WHERE id=?",(mid,))
-        segments=stt(path) if os.getenv("STT_API_URL") and os.getenv("STT_API_KEY") else fallback_segments()
+        gemini_cards=None
+        if os.getenv("GEMINI_API_KEY"):
+            segments, gemini_cards = gemini_extract(path, get_meeting(mid)["meeting_date"])
+        else:
+            segments=stt(path) if os.getenv("STT_API_URL") and os.getenv("STT_API_KEY") else fallback_segments()
         if not segments: raise RuntimeError("PROCESSING_FAILED")
         ids=[]
         with db() as c:
             for s in segments:
                 sid=str(uuid.uuid4()); ids.append(sid); c.execute("INSERT INTO segments VALUES (?,?,?,?,?)",(sid,mid,int(s["start_ms"]),int(s["end_ms"]),s["text"]))
             c.execute("UPDATE meetings SET stage='extraction' WHERE id=?",(mid,))
-        cards=llm(segments,ids,get_meeting(mid)["meeting_date"]) if os.getenv("LLM_API_URL") and os.getenv("LLM_API_KEY") else {"decisions":[],"tasks":[]}
+        if gemini_cards is not None:
+            cards={"decisions":[],"tasks":[]}
+            for key in ("decisions","tasks"):
+                for card in gemini_cards.get(key,[]):
+                    index=card.pop("source_segment_index", None)
+                    if isinstance(index,int) and 0 <= index < len(ids): card["source_segment_id"]=ids[index]; cards[key].append(card)
+        else:
+            cards=llm(segments,ids,get_meeting(mid)["meeting_date"]) if os.getenv("LLM_API_URL") and os.getenv("LLM_API_KEY") else {"decisions":[],"tasks":[]}
         with db() as c:
             valid=set(ids)
             for d in cards.get("decisions",[]):
@@ -161,8 +172,31 @@ def process_meeting(mid,path,duration):
 
 def stt(path):
     with httpx.Client(timeout=300) as h:
-        r=h.post(os.environ["STT_API_URL"],headers={"Authorization":"Bearer "+os.environ["STT_API_KEY"]},files={"file":(path.name,path.open("rb"),"audio/wav")},data={"response_format":"verbose_json"}); r.raise_for_status(); data=r.json()
+        r=h.post(os.environ["STT_API_URL"],headers={"Authorization":"Bearer "+os.environ["STT_API_KEY"]},files={"file":(path.name,path.open("rb"),"audio/wav")},data={"model":os.getenv("STT_MODEL","whisper-large-v3-turbo"),"response_format":"verbose_json"}); r.raise_for_status(); data=r.json()
     return [{"start_ms":int(x["start"]*1000),"end_ms":int(x["end"]*1000),"text":x["text"].strip()} for x in data.get("segments",[]) if x.get("text"," ").strip()]
+
+def gemini_extract(path, meeting_date):
+    """Transcribe audio and extract cards in one Gemini request."""
+    mime=mimetypes.guess_type(path.name)[0] or "audio/wav"
+    encoded=base64.b64encode(path.read_bytes()).decode("ascii")
+    prompt=f'''Ты обрабатываешь русскоязычную запись встречи от {meeting_date}.
+Верни только валидный JSON без markdown и комментариев:
+{{"segments":[{{"start_ms":0,"end_ms":1000,"text":"..."}}],"decisions":[{{"text":"...","source_segment_index":0}}],"tasks":[{{"text":"...","assignee":null,"due_date":null,"source_segment_index":0}}]}}
+Разбей расшифровку на последовательные смысловые сегменты с временными метками в миллисекундах. Индекс источника начинается с 0. Не выдумывай исполнителя и срок: неизвестные значения null. Относительные сроки указывай в YYYY-MM-DD только если дата однозначна, иначе null.'''
+    model=os.getenv("GEMINI_MODEL","gemini-2.5-flash")
+    url=f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    payload={"contents":[{"parts":[{"text":prompt},{"inline_data":{"mime_type":mime,"data":encoded}}]}],"generationConfig":{"responseMimeType":"application/json","temperature":0.1}}
+    with httpx.Client(timeout=300) as h:
+        response=h.post(url,params={"key":os.environ["GEMINI_API_KEY"]},json=payload); response.raise_for_status(); data=response.json()
+    text=data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    if text.startswith("```"): text=text.split("\n",1)[1].rsplit("```",1)[0].strip()
+    result=json.loads(text)
+    segments=[]
+    for s in result.get("segments",[]):
+        if s.get("text","").strip() and int(s.get("end_ms",0)) > int(s.get("start_ms",0)):
+            segments.append({"start_ms":max(0,int(s["start_ms"])),"end_ms":int(s["end_ms"]),"text":s["text"].strip()})
+    if not segments: raise RuntimeError("PROCESSING_FAILED")
+    return segments,{"decisions":result.get("decisions",[]),"tasks":result.get("tasks",[])}
 
 def llm(segments,ids,date):
     prompt={"meeting_date":date,"segments":[{"id":i,"text":s["text"],"start_ms":s["start_ms"],"end_ms":s["end_ms"]} for i,s in zip(ids,segments)]}
